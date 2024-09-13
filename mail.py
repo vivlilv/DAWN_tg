@@ -83,12 +83,6 @@ def fetch_emails_from_folder(imap, folder, target_sender):
                     # Extract the body
                     body = get_email_body(email_message)
 
-                    # print(f"Found email from {target_sender}!")
-                    # print(f"Sender: {sender}")
-                    # print(f"Subject: {subject}")
-                    # print(f"Date: {date}")
-                    # print(f"Body: {body}")
-                    # print("-" * 50)
                     return body
 
 
@@ -102,7 +96,9 @@ def get_specific_email_senders(username, password, target_sender):
         imap.login(username, password)
 
         body = fetch_emails_from_folder(imap, "Junk", target_sender)
-        # fetch_emails_from_folder(imap, "INBOX", target_sender)
+        # if body is None:
+        #     # If not found in Junk, try Inbox
+        #     body = fetch_emails_from_folder(imap, "INBOX", target_sender)
 
     except imaplib.IMAP4.error as e:
         print(f"An IMAP error occurred: {str(e)}")
