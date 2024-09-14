@@ -1,135 +1,103 @@
-import httpx
+import random
 import asyncio
+import httpx
+import logging
 from datetime import datetime
+from typing import List, Dict, Optional
 from captcha import solve_captcha 
 from mail import get_verification_link
 from mongo import client
+from config import SETTINGS
 
-#Constants:
-exp_token = '2056b72d0eb33beb2a6d2d39c67296afa677fc1f271efaf0d84b5d50cd08aee410c07f2f8a6510b58ab067551517964a9b712a207a15ea4f311b2b0364b0fd4be4b73a16b0be5708eaea1eeecc896238091f290f0f7a173e8a665a8cda3fe8625e6669adee14f08415335e123bac05218478fd5bfaf8810145bd97daf7c53b5039db2dd60cfd0de17ab9bd349623887c02a7789691d1c1fd02de15b2d9061b55c82233432f43b08ee746286fcc9515a18adfc9193e433d8c56c867a3e8a54ade18f11660f597e5fa46099ca5f2cc5f59356039379db30f6dc8af5c355ab82406c41fba212b6b3cc3eb36759c84491347'
-
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class AccountsManager:
     def __init__(self):
         self.client = client
-        self.db = self.client['dawn_profiles']
-        self.collection = self.db['user_entries']
-        self.active_accounts = {}
-        self.add_new_accounts = {}
+        self.db = self.client[SETTINGS['DB_NAME']]
+        self.collection = self.db[SETTINGS['COLLECTION_NAME']]
+        self.active_accounts: Dict[str, Account] = {}
+        self.add_new_accounts: Dict[str, Account] = {}
 
+    async def fetch_accounts(self, query: Dict) -> List[Dict]:
+        return await self.collection.find(query).to_list(length=None)
 
-    async def fetch_active_registered_accounts(self):
-        return list(self.collection.find({'account_state': 'active','registered': True}))
+    async def fetch_active_registered_verified_accounts(self) -> List[Dict]:
+        return await self.fetch_accounts({'account_state': 'active', 'registered': True, 'verified': True})
 
-
-    async def fetch_registered_accounts(self):
-        return list(self.collection.find({'registered': True}))
-
-
-    async def fetch_unregistered_accounts(self):
-        return list(self.collection.find({'registered': False}))
-
+    async def fetch_unregistered_or_unverified_accounts(self) -> List[Dict]:
+        return await self.fetch_accounts({'$or': [{'registered': False}, {'verified': False}]})
 
     async def run_active_registered_accounts(self):
-        # Add new accounts from the buffer (self.add_new_accounts) to active accounts
+        print(self.add_new_accounts)
         for account_id, account_instance in self.add_new_accounts.items():
             if account_id not in self.active_accounts:
                 self.active_accounts[account_id] = account_instance
-                print(f"Starting task for account {account_id}")
+                logging.info(f"Starting task for account {account_id}")
                 asyncio.create_task(self.active_accounts[account_id].start_task())
-
         self.add_new_accounts.clear()
-        
-        # # Stop tasks for active_accounts that are no longer active
-        # for account_id in list(self.active_accounts.keys()):
-        #     if account_id not in active_ids:
-        #         self.active_accounts[account_id].stop()
-        #         del self.active_accounts[account_id]
-
 
     async def check_db_for_changes(self):
-        current_active_accounts = await self.fetch_active_registered_accounts()
+        current_active_accounts = await self.fetch_active_registered_verified_accounts()
+        unregistered_or_unverified = await self.fetch_unregistered_or_unverified_accounts()
+        
         current_ids = {acc['_id'] for acc in current_active_accounts}
+        current_ids.update({acc['_id'] for acc in unregistered_or_unverified})
 
-        # Identify new accounts not in self.active_accounts
         new_accounts = [acc for acc in current_active_accounts if acc['_id'] not in self.active_accounts]
-
-        # Add new accounts to self.add_new_accounts for processing later
+        new_accounts.extend([acc for acc in unregistered_or_unverified if acc['_id'] not in self.active_accounts])
+        
         for acc in new_accounts:
-            self.add_new_accounts[acc['_id']] = Account(acc)
+            self.add_new_accounts[acc['_id']] = Account(account_details=acc, collection=self.collection)
 
-        # Remove accounts that have switched to "sleep" from active_accounts
         for account_id in list(self.active_accounts):
             if account_id not in current_ids:
-                try:
-                    self.active_accounts[account_id].stop_task()
-                except:
-                    print('error canceling task')
+                await self.active_accounts[account_id].stop_task()
                 del self.active_accounts[account_id]
-        
-
-        # Unregistered handling
-        unregistered_accounts = await self.fetch_unregistered_accounts()
-        for acc in unregistered_accounts:
-            account = Account(account_details=acc)
-            result = await account.full_registration()
-            if result==200:
-                self.collection.update_one({'_id': acc['_id']}, {'$set': {'registered': True}})
-
-
+            else:
+                updated_acc = next(acc for acc in current_active_accounts if acc['_id'] == account_id)
+                self.active_accounts[account_id].points = updated_acc.get('points', 0)
 
     async def run(self):
+        logging.info("Starting AccountsManager.run()")
         while True:
-            await self.check_db_for_changes()
-            print('run active')
-            await self.run_active_registered_accounts()
-            await asyncio.sleep(600)
-
-
+            try:
+                logging.info("Checking DB for changes")
+                await self.check_db_for_changes()
+                logging.info("Running active registered accounts")
+                await self.run_active_registered_accounts()
+            except Exception as e:
+                logging.error(f"Error in main loop: {e}", exc_info=True)
+            logging.info(f"Sleeping for {SETTINGS['CHECK_INTERVAL']} seconds")
+            await asyncio.sleep(SETTINGS['CHECK_INTERVAL'])
 
 class Account:
-    def __init__(self,account_details) -> None:
+    def __init__(self, account_details: Dict, collection):
         self.account_details = account_details
-        self.session = httpx.AsyncClient(http2=True, proxy=self.account_details['proxy'], verify=False)
-        self.task=None
-    
+        self.session = httpx.AsyncClient(http2=True, verify=False)
+        self.task: Optional[asyncio.Task] = None
+        self.collection = collection
+        self.should_stop = False
+        self.points = self.account_details.get('points', 0)
 
     async def set_session(self):
-        self.session.headers.update({
-            "accept": "*/*",
-            "accept-encoding": "gzip, deflate, br, zstd",
-            "accept-language": "en-US,en;q=0.9",
-            "origin": "chrome-extension://fpdkjdnhkakefebpekbdhillbhonfjjp",
-            "priority": "u=1, i",
-            "sec-ch-ua": "\"Not)A;Brand\";v=\"99\", \"Google Chrome\";v=\"127\", \"Chromium\";v=\"127\"",
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": "\"Linux\"",
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "cross-site",
-            "user-agent": self.account_details['user_agent']
-        })
+        self.session.headers.update(SETTINGS['DEFAULT_HEADERS'])
+        self.session.headers.update({"user-agent": self.account_details['user_agent']})
 
-    #CAPTCHa solving(2)
-    async def get_puzzle(self):
-        url = "https://www.aeropres.in/chromeapi/dawn/v1/puzzle/get-puzzle"
+    async def get_puzzle(self) -> str:
+        url = f"{SETTINGS['BASE_URL']}/puzzle/get-puzzle"
         response = await self.session.get(url)
         response.raise_for_status()
-        data = response.json()
-        return data.get('puzzle_id')
+        return response.json()['puzzle_id']
 
-
-    async def get_puzzle_base_64(self,puzzle_id):
-        url = f"https://www.aeropres.in/chromeapi/dawn/v1/puzzle/get-puzzle-image?puzzle_id={puzzle_id}"
+    async def get_puzzle_base_64(self, puzzle_id: str) -> str:
+        url = f"{SETTINGS['BASE_URL']}/puzzle/get-puzzle-image?puzzle_id={puzzle_id}"
         response = await self.session.get(url)
         response.raise_for_status()
-        data = response.json()
-        return data.get('imgBase64')
+        return response.json()['imgBase64']
 
-
-    #Registration and logging(4)
-    async def register_user(self,puzzle_id, solution):
-        url = "https://www.aeropres.in/chromeapi/dawn/v1/puzzle/validate-register"
+    async def register_user(self, puzzle_id: str, solution: str) -> int:
+        url = f"{SETTINGS['BASE_URL']}/puzzle/validate-register"
         registration_data = {
             "ans": solution,
             "country": "+91",
@@ -141,232 +109,244 @@ class Account:
             "mobile": "",
             "referralCode": ""
         }
-        
-        response = await self.session.post(url, json=registration_data)
-        
-        if response.status_code == 200:
-            return 200
-        else:
-            return 400
-            
-
-    async def verify_mail(self):
-        try:
-            for i in range(5):
-                link = get_verification_link(username=self.account_details['mail'],password=self.account_details['mail_pass'])
-                print(link)
-                if link[:5] == 'https':
-                    break
-
-            self.session.headers.update({
-                "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-                "accept-encoding": "gzip, deflate, br, zstd",
-                "accept-language": "en-US,en;q=0.9",
-                "priority": "u=0, i",
-                "sec-ch-ua": "\"Not)A;Brand\";v=\"99\", \"Google Chrome\";v=\"127\", \"Chromium\";v=\"127\"",
-                "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": "\"Linux\"",
-                "sec-fetch-dest": "document",
-                "sec-fetch-mode": "navigate",
-                "sec-fetch-site": "none",
-                "sec-fetch-user": "?1",
-                "upgrade-insecure-requests": "1",
-                "user-agent": self.account_details['user_agent']
-            })
-            response = await self.session.get(link)
-            # print(response)
-        except:
-            print('email retrieving error...')
-
-
-    async def login(self,puzzle_id,solution):
-        self.session.headers.update({
+        headers = {
             "accept": "*/*",
             "accept-encoding": "gzip, deflate, br, zstd",
             "accept-language": "en-US,en;q=0.9",
             "content-type": "application/json",
             "origin": "chrome-extension://fpdkjdnhkakefebpekbdhillbhonfjjp",
             "priority": "u=1, i",
-            "sec-ch-ua": "\"Not)A;Brand\";v=\"99\", \"Google Chrome\";v=\"127\", \"Chromium\";v=\"127\"",
+            "sec-ch-ua": '"Not)A;Brand";v="99", "Google Chrome";v="127", "Chromium";v="127"',
             "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": "\"Linux\"",
+            "sec-ch-ua-platform": '"Linux"',
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "cross-site",
-            "user-agent": self.account_details['user_agent']
-        })
+            "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+        }
+        response = await self.session.post(url, json=registration_data, headers=headers)
+        print(response.json())
+        return response.status_code
 
+    async def verify_mail(self) -> Optional[str]:
+        for _ in range(5):
+            try:
+                link = get_verification_link(username=self.account_details['mail'], password=self.account_details['mail_pass'])
+                if link.startswith('https'):
+                    self.session.headers.update(SETTINGS['VERIFICATION_HEADERS'])
+                    await self.session.get(link)
+                    return link
+            except Exception as e:
+                logging.error(f"Error while getting email: {e}")
+            await asyncio.sleep(10)
+        return None
+
+    async def login(self, puzzle_id: str, solution: str) -> Optional[str]:
+        url = f"{SETTINGS['BASE_URL']}/user/login/v2"
         login_data = {
             "username": self.account_details['mail'],
             "password": self.account_details['mail_pass'],
             "logindata": {
-                "_v": "1.0.7",
-                "datetime": str(datetime.utcnow().isoformat(timespec='milliseconds') + 'Z')
+                "_v": SETTINGS['VERSION'],
+                "datetime": datetime.utcnow().isoformat(timespec='milliseconds') + 'Z'
             },
             "puzzle_id": puzzle_id,
             "ans": solution
         }
-        status = None
-        for i in range(2):
-            if status!='200':
-                try:
-                    response = await self.session.post(url="https://www.aeropres.in/chromeapi/dawn/v1/user/login/v2", json=login_data)
-                    print(response.json())
-                    if response.json()['message']=='Successfully logged in!':
-                        status='200'
-                except:
-                    await asyncio.sleep(5)
-        return response.json()['data']['token']
-    
-
-    async def logout(self):
-        try:
-            await self.get_user_referral_points(token=exp_token)
-            await self.keep_alive(token=exp_token)
-            print("logged out")
-        except:
-            print('error logging out (server error 502)...retrying after 15s')
-
-
-    #Farming
-    async def get_user_referral_points(self,token):
-        url = "https://www.aeropres.in/api/atom/v1/userreferral/getpoint"
-        self.session.headers.update({
+        headers = {
             "accept": "*/*",
-            "accept-encoding": "gzip, deflate, br, zstd",
             "accept-language": "en-US,en;q=0.9",
-            "authorization": f"Berear {token}",
             "content-type": "application/json",
-            "if-none-match": "W/\"336-jMb+AmW+rUVEfl0AseCEvUmbrVc\"",
             "origin": "chrome-extension://fpdkjdnhkakefebpekbdhillbhonfjjp",
-            "priority": "u=1, i",
-            "sec-ch-ua": "\"Not)A;Brand\";v=\"99\", \"Google Chrome\";v=\"127\", \"Chromium\";v=\"127\"",
+            "sec-ch-ua": '"Not)A;Brand";v="99", "Google Chrome";v="127", "Chromium";v="127"',
             "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": "\"Linux\"",
+            "sec-ch-ua-platform": '"Linux"',
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "cross-site",
-            "user-agent": self.account_details['user_agent']
-        })
+        }
+        response = await self.session.post(url, json=login_data, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        if data['message'] == 'Successfully logged in!':
+            return data['data']['token']
+        return None
 
-
-        response = await self.session.get(url)
-        print(response.json()['data']['rewardPoint']['points'])
-        return response.json()
-
-
-    async def keep_alive(self,token):
-        url = "https://www.aeropres.in/chromeapi/dawn/v1/userreward/keepalive"
-        self.session.headers.update({
+    async def get_user_referral_points(self, token: str) -> Dict:
+        url = SETTINGS['GET_POINT_URL']
+        headers = {
             "accept": "*/*",
             "accept-encoding": "gzip, deflate, br, zstd",
             "accept-language": "en-US,en;q=0.9",
-            "authorization": f"Berear {token}",
+            "authorization": f"Bearer {token}",
+            "content-type": "application/json",
+            "if-none-match": 'W/"337-NtHbWrVXbnADn2xC9gA7fTkFhMo"',
+            "origin": "chrome-extension://fpdkjdnhkakefebpekbdhillbhonfjjp",
+            "priority": "u=1, i",
+            "sec-ch-ua": '"Not)A;Brand";v="99", "Google Chrome";v="127", "Chromium";v="127"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Linux"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "cross-site",
+            "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+        }
+        response = await self.session.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        new_points = data['data']['rewardPoint']['points']
+        
+        if new_points != self.points:
+            self.points = new_points
+            await self.update_points_in_db(new_points)
+        
+        logging.info(f"Current points: {self.points}")
+        return data
+
+    async def update_points_in_db(self, new_points: int):
+        await self.collection.update_one(
+            {'_id': self.account_details['_id']},
+            {'$set': {'points': new_points}}
+        )
+        logging.info(f"Updated points in database for {self.account_details['name']}: {new_points}")
+
+    async def keep_alive(self, token: str) -> int:
+        url = f"{SETTINGS['BASE_URL']}/userreward/keepalive"
+        headers = {
+            "accept-encoding": "gzip, deflate, br, zstd",
+            "accept-language": "en-US,en;q=0.9",
+            "authorization": f"Bearer {token}",
             "content-type": "application/json",
             "origin": "chrome-extension://fpdkjdnhkakefebpekbdhillbhonfjjp",
             "priority": "u=1, i",
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "cross-site",
-            "user-agent": self.account_details['user_agent']
-        })
-
+            "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+        }
         body = {
             "username": self.account_details['name'],
-                "extensionid": "fpdkjdnhkakefebpekbdhillbhonfjjp",
-                "numberoftabs": 0,
-                "_v": "1.0.7",
+            "extensionid": SETTINGS['EXTENSION_ID'],
+            "numberoftabs": 0,
+            "_v": SETTINGS['VERSION'],
         }
-
-        response = await self.session.post(url,json=body)
+        response = await self.session.post(url, json=body, headers=headers)
         return response.status_code
 
+    async def full_registration(self) -> int:
+        logging.info(f"Starting registration for {self.account_details['name']}")
 
-
-
-    #MAIN WORKFLOW FUNCTIONS
-    async def full_registration(self):
-        print(self.account_details)
+        sl=random.randint(1,60)
+        print(f'sleeping for {sl}')
+        await asyncio.sleep(sl)
         await self.set_session()
-        response=None
-        for i in range(10):#max retries
-            try:
-                puzzle_id = await self.get_puzzle() 
-                img_base_64 = await self.get_puzzle_base_64(puzzle_id)
-                solution = await solve_captcha(img_base_64)
-                await asyncio.sleep(5)
-                response = await self.register_user(puzzle_id,solution)
-                print(response)
-                if response == 200:
-                    break
-            except:
-                print(f'{i+1}Error in registration, retrying...')
-                await asyncio.sleep(10)
-
-        if response==200:
-            #registered, needs to verify        
-            for i in range(5):
-                try:
-                    link = await self.verify_mail()#add try except within function
-                    print(link)
-                    if link!=None and len(link)>10 and link[:4]=='http':
-                        print('success')
+        try:
+            for _ in range(10):
+                if not self.account_details.get('registered'):
+                    puzzle_id = await self.get_puzzle()
+                    img_base_64 = await self.get_puzzle_base_64(puzzle_id)
+                    solution = await solve_captcha(img_base_64)
+                    await asyncio.sleep(25)
+                    response = await self.register_user(puzzle_id, solution)
+                    if response == 200:
+                        await self.update_registration_status(True)
+                        logging.info(f"Account {self.account_details['name']} successfully registered")
+                        break
+            for _ in range(10):
+                if not self.account_details.get('verified'):
+                    if await self.verify_mail():
+                        await self.update_verification_status(True)
+                        logging.info(f"Account {self.account_details['name']} successfully verified")
                         return 200
-                    else:
-                        print('mail not received...')
-                except:
-                    print('mail retrieving error, retrying...')
-                    await asyncio.sleep(10)
-        #couldn't verify user  
+        except Exception as e:
+            logging.error(f"Error during registration: {e}")
+            await asyncio.sleep(10)
         return 400
 
-    
+    async def update_registration_status(self, status: bool):
+        await self.collection.update_one(
+            {'_id': self.account_details['_id']},
+            {'$set': {'registered': status}}
+        )
+        self.account_details['registered'] = status
+
+    async def update_verification_status(self, status: bool):
+        await self.collection.update_one(
+            {'_id': self.account_details['_id']},
+            {'$set': {'verified': status}}
+        )
+        self.account_details['verified'] = status
+
     async def farm(self):
-        print('farming')
+        logging.info(f"Starting farming for {self.account_details['name']}")
         await self.set_session()
-        for i in range(10):#max retries
+        print('token---\n',self.account_details.get('token'),'\n---token')
+        if not self.account_details.get('registered') or not self.account_details.get('verified'):
+            await self.full_registration()
+        if not self.account_details.get('token'):
+            await self.login_with_retry()
+        
+        while not self.should_stop and self.account_details['account_state'] == 'active':
             try:
-                puzzle_id = await self.get_puzzle() 
+                await asyncio.gather(
+                    self.get_user_referral_points(self.account_details['token']),
+                    self.keep_alive_with_retry(self.account_details['token'])
+                )
+            except Exception as e:
+                logging.error(f"Error during farming: {e}")
+            await asyncio.sleep(110)
+
+    async def login_with_retry(self, max_retries: int = 10):
+        for attempt in range(max_retries):
+            try:
+                puzzle_id = await self.get_puzzle()
                 img_base_64 = await self.get_puzzle_base_64(puzzle_id)
                 solution = await solve_captcha(img_base_64)
-                await asyncio.sleep(10)
-                token = await self.login(puzzle_id=puzzle_id,solution=solution)
-                if len(token)>3 and token[:3]=='205':#valid token
-                    print(token)
-                    break
-            except:
-                print(f"error logging in...{self.account_details['name']}")
-        
-        while self.account_details['account_state']=='active':
-            try:
-                await self.get_user_referral_points(token)
-                for i in range(5):
-                    status = await self.keep_alive(token)
-                    print(status)
-                    await asyncio.sleep(10)
-                    if status == 200:
-                        break
-            finally:
-                print('sleeing 110s')
-                await asyncio.sleep(110)
-            
+                await asyncio.sleep(25)
+                token = await self.login(puzzle_id=puzzle_id, solution=solution)
+                if token:
+                    await self.update_token_in_db(token)
+                    return
+            except Exception as e:
+                logging.error(f"Login error (attempt {attempt + 1}): {e}")
+            await asyncio.sleep(10)
+        logging.error(f"Failed to login after {max_retries} attempts")
 
-    #these 2 functions to manage FARM function
-    def start_task(self):
+    async def keep_alive_with_retry(self, token: str, max_retries: int = 5):
+        for attempt in range(max_retries):
+            try:
+                status = await self.keep_alive(token)
+                if status == 200:
+                    return
+            except Exception as e:
+                logging.error(f"Keep_alive error (attempt {attempt + 1}): {e}")
+            await asyncio.sleep(10)
+        logging.error("Failed to perform keep_alive after all attempts")
+
+    async def update_token_in_db(self, token: str):
+        await self.collection.update_one(
+            {'_id': self.account_details['_id']},
+            {'$set': {'token': token}}
+        )
+
+    async def start_task(self):
         if self.task is None:
             self.should_stop = False
+            if not self.account_details.get('registered') or not self.account_details.get('verified'):
+                logging.info(f"Starting registration/verification for account {self.account_details['name']}")
+                await self.full_registration()
             self.task = asyncio.create_task(self.farm())
 
-
-    def stop_task(self):
+    async def stop_task(self):
         if self.task is not None:
             self.should_stop = True
             self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
             self.task = None
 
-    
 
-
-if __name__=='__main__':
-    manager = AccountsManager()
-    asyncio.run(manager.run())
+manager = AccountsManager()
+asyncio.run(manager.run())
