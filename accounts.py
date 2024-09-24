@@ -1,55 +1,129 @@
-import random
 import asyncio
-import httpx
+import aiohttp
 import logging
 from datetime import datetime
+from collections import deque
 from typing import List, Dict, Optional
 from captcha import solve_captcha 
 from mail import get_verification_link
 from mongo import client
 from config import SETTINGS
+import ssl
+import certifi
+import random
+import re
+import json
+from aiohttp_socks import ProxyConnector
+from urllib.parse import urlparse
+import signal
+import sys
+import atexit
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def parse_user_agent(user_agent):
+    browser_match = re.search(r'(Opera|Chrome|Safari|Firefox|MSIE|Trident(?=/))', user_agent)
+    browser = browser_match.group(1) if browser_match else "Unknown"
+    
+    version_match = re.search(r'(?:Version|'+ browser + r')/(\d+(\.\d+)?)', user_agent)
+    version = version_match.group(1) if version_match else "0"
+    
+    platform_match = re.search(r'\((.*?)\)', user_agent)
+    platform = platform_match.group(1).split(';')[0] if platform_match else "Unknown"
+    
+    return browser, version, platform
 
 class AccountsManager:
     def __init__(self):
         self.client = client
         self.db = self.client[SETTINGS['DB_NAME']]
-        self.collection = self.db[SETTINGS['COLLECTION_NAME']]
+        self.collection = self.db[SETTINGS['ACCOUNTS_COLLECTION']]
         self.active_accounts: Dict[str, Account] = {}
         self.add_new_accounts: Dict[str, Account] = {}
+        self.registration_queue = deque()
+        self.max_simultaneous_registrations = SETTINGS['REGISTRATION_THREADS']
+        self.currently_registering = set()
+        self.clear_registration_queue()
+        self.shutdown_flag = False
+        self.shutdown_event = asyncio.Event()
+        atexit.register(self.cleanup)
 
-    async def fetch_accounts(self, query: Dict) -> List[Dict]:
-        return await self.collection.find(query).to_list(length=None)
+    def setup_signal_handlers(self):
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGINT, self.signal_handler)
+        loop.add_signal_handler(signal.SIGTERM, self.signal_handler)
+
+    def signal_handler(self):
+        if not self.shutdown_event.is_set():
+            logging.info("Received shutdown signal.")
+            self.shutdown_event.set()
+            asyncio.create_task(self.shutdown())
+        else:
+            logging.info("Shutdown signal already received, ignoring.")
+
+    async def shutdown(self):
+        logging.info("Shutting down, closing sessions.")
+        await self.close_all_sessions()
+        sys.exit(0)
+
+    async def close_all_sessions(self):
+        for account in self.active_accounts.values():
+            await account.close_session()
+
+    def cleanup(self):
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop.run_until_complete(self.close_all_sessions())
+        else:
+            asyncio.run(self.close_all_sessions())
+
+    def clear_registration_queue(self):
+        self.registration_queue.clear()
+        logging.info("Cleared registration queue on launch.")
 
     async def fetch_active_registered_verified_accounts(self) -> List[Dict]:
-        return await self.fetch_accounts({'account_state': 'active', 'registered': True, 'verified': True})
+        return await self.collection.find({'account_state': 'active', 'registered': True, 'verified': True}).to_list(length=None)
 
     async def fetch_unregistered_or_unverified_accounts(self) -> List[Dict]:
-        return await self.fetch_accounts({'$or': [{'registered': False}, {'verified': False}]})
+        return await self.collection.find({
+            '$or': [{'registered': False}, {'verified': False}],
+            'registration_failed': {'$ne': True}
+        }).to_list(length=None)
 
     async def run_active_registered_accounts(self):
-        print(self.add_new_accounts)
-        for account_id, account_instance in self.add_new_accounts.items():
-            if account_id not in self.active_accounts:
-                self.active_accounts[account_id] = account_instance
-                logging.info(f"Starting task for account {account_id}")
-                asyncio.create_task(self.active_accounts[account_id].start_task())
-        self.add_new_accounts.clear()
+        while True:
+            logging.info(f"Working on new accounts: {self.add_new_accounts}")
+            for account_id, account_instance in self.add_new_accounts.items():
+                if account_id not in self.active_accounts:
+                    self.active_accounts[account_id] = account_instance
+                    logging.info(f"Starting task for account {account_id}: {account_instance.account_details['mail']}")
+                    asyncio.create_task(self.active_accounts[account_id].start_task())
+            self.add_new_accounts.clear()
+
+            await asyncio.sleep(180)
 
     async def check_db_for_changes(self):
         current_active_accounts = await self.fetch_active_registered_verified_accounts()
         unregistered_or_unverified = await self.fetch_unregistered_or_unverified_accounts()
-        
+
+        for a in unregistered_or_unverified:
+            print('Mail:',a['mail'])
+
         current_ids = {acc['_id'] for acc in current_active_accounts}
         current_ids.update({acc['_id'] for acc in unregistered_or_unverified})
-
+        print(current_ids)
         new_accounts = [acc for acc in current_active_accounts if acc['_id'] not in self.active_accounts]
         new_accounts.extend([acc for acc in unregistered_or_unverified if acc['_id'] not in self.active_accounts])
-        
+        print(new_accounts)
         for acc in new_accounts:
-            self.add_new_accounts[acc['_id']] = Account(account_details=acc, collection=self.collection)
-
+            account = Account(account_details=acc, collection=self.collection)
+            print(acc['mail'])
+            if not acc.get('registered') or not acc.get('verified'):#add to registration queue
+                self.registration_queue.append(account)
+            else:#if account was paused, now resuming to work
+                self.add_new_accounts[acc['_id']] = account
+        
+        #if state changed to 'sleep':
         for account_id in list(self.active_accounts):
             if account_id not in current_ids:
                 await self.active_accounts[account_id].stop_task()
@@ -57,44 +131,205 @@ class AccountsManager:
             else:
                 updated_acc = next(acc for acc in current_active_accounts if acc['_id'] == account_id)
                 self.active_accounts[account_id].points = updated_acc.get('points', 0)
+    
+    async def process_registration_queue(self):
+        while self.registration_queue:
+            tasks = []
+            logging.info(f"Starting to process registration queue. Queue size: {len(self.registration_queue)}")
+            while self.registration_queue and len(self.currently_registering) < self.max_simultaneous_registrations:
+                account = self.registration_queue.popleft()
+                if not account.account_details.get('registration_failed'):
+                    self.currently_registering.add(account.account_details['_id'])
+                    tasks.append(asyncio.create_task(self.register_and_handle(account)))
+                    logging.info(f"Added account {account.account_details['name']} to registration tasks. Currently registering: {len(self.currently_registering)}")
+                else:
+                    logging.warning(f"Skipping registration for failed account: {account.account_details['name']}")
+            
+            if tasks:
+                logging.info(f"Waiting for {len(tasks)} registration tasks to complete.")
+                done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                logging.info(f"Completed {len(done)} tasks, {len(pending)} tasks still pending.")
+            else:
+                logging.info("No tasks created, sleeping for 5 seconds before checking the queue again.")
+                await asyncio.sleep(5)  # Wait before checking again if no tasks were created
+
+    async def register_and_handle(self, account):
+        try:
+            await account.full_registration()
+        finally:
+            self.currently_registering.remove(account.account_details['_id'])
+            if account.account_details.get('registered') and account.account_details.get('verified'):
+                await account.start_task()
+
+    async def register_account(self, account):
+        try:
+            logging.info(f"Starting registration for account {account.account_details['name']}")
+            result = await account.full_registration()
+            logging.info(result)
+            if result["registered"]:
+                self.add_new_accounts[account.account_details['_id']] = account
+                if result["verified"]:
+                    await self.update_registration_attempt(account, "Success")
+                else:
+                    await self.update_registration_attempt(account, "Registered but not verified")
+            else:
+                await self.update_registration_attempt(account, "Registration failed")
+        except Exception as e:
+            logging.error(f"Error registering account {account.account_details['name']}: {e}")
+        finally:
+            self.currently_registering.remove(account.account_details['_id'])
+            logging.info(f"Completed registration for account {account.account_details['name']}. Currently registering: {len(self.currently_registering)}")
+
+    async def update_registration_attempt(self, account, status):
+        await self.collection.update_one(
+            {'_id': account.account_details['_id']},
+            {'$set': {'registration_attempt': status}}
+        )
+
+    async def renew_all_tokens(self):
+        logging.info("Starting token renewal for all registered accounts")
+        current_active_accounts = await self.fetch_active_registered_verified_accounts()
+        
+        # Create a semaphore to limit concurrent token renewals
+        semaphore = asyncio.Semaphore(SETTINGS['REGISTRATION_THREADS'])
+
+        async def renew_token(acc):
+            async with semaphore:
+                account_id = acc['_id']
+                if account_id in self.active_accounts:
+                    account = self.active_accounts[account_id]
+                else:
+                    account = Account(account_details=acc, collection=self.collection)
+                    self.active_accounts[account_id] = account
+
+                logging.info(f"Renewing token for account: {acc['name']}")
+                await account.login_with_retry()
+
+        # Create tasks for all accounts
+        tasks = [asyncio.create_task(renew_token(acc)) for acc in current_active_accounts]
+
+        # Wait for all tasks to complete
+        await asyncio.gather(*tasks)
+
+        # Remove accounts that are no longer active, registered, or verified
+        current_ids = {acc['_id'] for acc in current_active_accounts}
+        for account_id in list(self.active_accounts.keys()):
+            if account_id not in current_ids:
+                await self.active_accounts[account_id].stop_task()
+                del self.active_accounts[account_id]
+
+        logging.info("Token renewal process completed")
 
     async def run(self):
-        logging.info("Starting AccountsManager.run()")
-        while True:
-            try:
-                logging.info("Checking DB for changes")
-                await self.check_db_for_changes()
-                logging.info("Running active registered accounts")
-                await self.run_active_registered_accounts()
-            except Exception as e:
-                logging.error(f"Error in main loop: {e}", exc_info=True)
-            logging.info(f"Sleeping for {SETTINGS['CHECK_INTERVAL']} seconds")
-            await asyncio.sleep(SETTINGS['CHECK_INTERVAL'])
+        self.setup_signal_handlers()
+        e = None  # Initialize e to None
+        try:
+            logging.info("Checking DB for changes")
+            await self.check_db_for_changes()
+            logging.info("Running active registered accounts")
+            await self.run_active_registered_accounts()
+            logging.info("Processing registration queue")
+            await self.process_registration_queue()
+            while True:
+                if self.shutdown_event.is_set():
+                    await self.shutdown()
+                try:
+                    logging.info("Checking DB for changes")
+                    await self.check_db_for_changes()
+                except Exception as e:
+                    logging.error(f"Error in main loop: {e}", exc_info=True)
+                logging.info(f"Sleeping for {SETTINGS['CHECK_INTERVAL']} seconds")
+                await asyncio.sleep(SETTINGS['CHECK_INTERVAL'])
+        except Exception as e:
+            logging.error(f"Error in main loop: {e}", exc_info=True)
+        except asyncio.CancelledError:
+            logging.info("Main loop cancelled")
+        finally:
+            if e:
+                logging.error(f"Unhandled exception: {e}", exc_info=True)
+            await self.shutdown()
 
 class Account:
     def __init__(self, account_details: Dict, collection):
         self.account_details = account_details
-        self.session = httpx.AsyncClient(http2=True, verify=False)
-        self.task: Optional[asyncio.Task] = None
         self.collection = collection
         self.should_stop = False
         self.points = self.account_details.get('points', 0)
+        self.task = None
+        self.session: Optional[aiohttp.ClientSession] = None
 
-    async def set_session(self):
+    async def create_session(self):
+        if self.session is None or self.session.closed:
+            proxy = self.account_details.get('proxy')
+            connector = aiohttp.TCPConnector(ssl=False)
+            
+            self.session = aiohttp.ClientSession(connector=connector)
+            
+            self.session.headers.update({
+                "user-agent": self.account_details['user_agent'],
+                "authorization": f"Bearer {self.account_details['token']}"
+            })
+
+            if proxy:
+                self.session._default_headers.update({
+                    "Proxy-Authorization": proxy
+                })
+
+    async def close_session(self):
+        if self.session and not self.session.closed:
+            await self.session.close()
+
+    async def set_headers(self):
         self.session.headers.update(SETTINGS['DEFAULT_HEADERS'])
         self.session.headers.update({"user-agent": self.account_details['user_agent']})
 
     async def get_puzzle(self) -> str:
-        url = f"{SETTINGS['BASE_URL']}/puzzle/get-puzzle"
-        response = await self.session.get(url)
-        response.raise_for_status()
-        return response.json()['puzzle_id']
+        url = f"{SETTINGS['BASE_URL']}/puzzle/get-puzzle?appid=undefined"
+        
+        browser, version, platform = parse_user_agent(self.account_details['user_agent'])
+        
+        headers = {
+            "accept": "*/*",
+            "accept-encoding": "gzip, deflate, br, zstd",
+            "accept-language": "en-US,en;q=0.9",
+            "origin": "chrome-extension://fpdkjdnhkakefebpekbdhillbhonfjjp",
+            "priority": "u=1, i",
+            "sec-ch-ua": f'"{browser}";v="{version}", "Not)A;Brand";v="99"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": f'"{platform}"',
+            "sec-fetch-dest": "empty",
+            "sec-fetch-mode": "cors",
+            "sec-fetch-site": "cross-site",
+            "user-agent": self.account_details['user_agent']
+        }
+        
+        
+        
+        logging.info(f"Sending request to: {url}")
+        # logging.info(f"Headers: {json.dumps(headers, indent=2)}")
+        
+        try:
+            self.session.headers.update(headers)
+            async with self.session.get(url) as response:
+                logging.info(f"Response status: {response.status}")
+                # logging.info(f"Response headers: {json.dumps(dict(response.headers), indent=2)}")
+                
+                response.raise_for_status()
+                data = await response.json()
+                # logging.info(f"Response data: {json.dumps(data, indent=2)}")
+                
+                return data['puzzle_id']
+        except Exception as e:
+            logging.error(f"Error in get_puzzle: {str(e)}")
+            # logging.error(f"Account details: {json.dumps(self.account_details, indent=2, default=str)}")
+            raise
 
     async def get_puzzle_base_64(self, puzzle_id: str) -> str:
-        url = f"{SETTINGS['BASE_URL']}/puzzle/get-puzzle-image?puzzle_id={puzzle_id}"
-        response = await self.session.get(url)
-        response.raise_for_status()
-        return response.json()['imgBase64']
+        url = f"{SETTINGS['BASE_URL']}/puzzle/get-puzzle-image?puzzle_id={puzzle_id}&appid=undefined"
+        async with self.session.get(url) as response:
+            response.raise_for_status()
+            data = await response.json()
+            return data['imgBase64']
 
     async def register_user(self, puzzle_id: str, solution: str) -> int:
         url = f"{SETTINGS['BASE_URL']}/puzzle/validate-register"
@@ -107,26 +342,12 @@ class Account:
             "password": self.account_details['mail_pass'],
             "puzzle_id": puzzle_id,
             "mobile": "",
-            "referralCode": ""
+            "referralCode": self.account_details.get('referralCode', '')
         }
-        headers = {
-            "accept": "*/*",
-            "accept-encoding": "gzip, deflate, br, zstd",
-            "accept-language": "en-US,en;q=0.9",
-            "content-type": "application/json",
-            "origin": "chrome-extension://fpdkjdnhkakefebpekbdhillbhonfjjp",
-            "priority": "u=1, i",
-            "sec-ch-ua": '"Not)A;Brand";v="99", "Google Chrome";v="127", "Chromium";v="127"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Linux"',
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "cross-site",
-            "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
-        }
-        response = await self.session.post(url, json=registration_data, headers=headers)
-        print(response.json())
-        return response.status_code
+        async with self.session.post(url, json=registration_data) as response:
+            data = await response.json()
+            logging.info(f"Registration response for {self.account_details['name']}: {data}")
+            return response.status
 
     async def verify_mail(self) -> Optional[str]:
         for _ in range(5):
@@ -142,7 +363,7 @@ class Account:
         return None
 
     async def login(self, puzzle_id: str, solution: str) -> Optional[str]:
-        url = f"{SETTINGS['BASE_URL']}/user/login/v2"
+        url = f"{SETTINGS['BASE_URL']}/user/login/v2?appid=undefined"
         login_data = {
             "username": self.account_details['mail'],
             "password": self.account_details['mail_pass'],
@@ -164,44 +385,49 @@ class Account:
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "cross-site",
+            "user-agent": self.account_details['user_agent']
         }
-        response = await self.session.post(url, json=login_data, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-        if data['message'] == 'Successfully logged in!':
-            return data['data']['token']
-        return None
+        self.session.headers.update(headers)
+        try:
+            async with self.session.post(url, json=login_data) as response:
+                logging.info(await response.text())
+                response.raise_for_status()
+                data = await response.json()
+                if data.get('message') == 'Successfully logged in!':
+                    return data.get('data', {}).get('token')
+                else:
+                    logging.warning(f"Login failed: {data.get('message', 'Unknown error')}")
+                    return None
+        except Exception as e:
+            logging.error(f"Error during login request: {str(e)}", exc_info=True)
+            return None
 
     async def get_user_referral_points(self, token: str) -> Dict:
+        await self.create_session()
         url = SETTINGS['GET_POINT_URL']
         headers = {
-            "accept": "*/*",
-            "accept-encoding": "gzip, deflate, br, zstd",
-            "accept-language": "en-US,en;q=0.9",
-            "authorization": f"Bearer {token}",
-            "content-type": "application/json",
-            "if-none-match": 'W/"337-NtHbWrVXbnADn2xC9gA7fTkFhMo"',
-            "origin": "chrome-extension://fpdkjdnhkakefebpekbdhillbhonfjjp",
-            "priority": "u=1, i",
-            "sec-ch-ua": '"Not)A;Brand";v="99", "Google Chrome";v="127", "Chromium";v="127"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Linux"',
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "cross-site",
-            "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+            "authorization": f"Berear {token}",
+            "user-agent": self.account_details['user_agent']
         }
-        response = await self.session.get(url, headers=headers)
-        response.raise_for_status()
-        data = response.json()
-        new_points = data['data']['rewardPoint']['points']
         
-        if new_points != self.points:
-            self.points = new_points
-            await self.update_points_in_db(new_points)
-        
-        logging.info(f"Current points: {self.points}")
-        return data
+        try:
+            async with self.session.get(url, headers=headers) as response:
+                logging.info(f"Response status: {response.status}")
+                # logging.info(f"Response headers: {dict(response.headers)}")
+                
+                response.raise_for_status()
+                data = await response.json()
+                
+                new_points = data['data']['rewardPoint']['points']
+                if new_points != self.points:
+                    self.points = new_points
+                    await self.update_points_in_db(new_points)
+                
+                logging.info(f"Current points: {self.points}")
+                return data
+        except Exception as e:
+            logging.error(f"Error in get_user_referral_points: {str(e)}")
+            raise
 
     async def update_points_in_db(self, new_points: int):
         await self.collection.update_one(
@@ -215,14 +441,14 @@ class Account:
         headers = {
             "accept-encoding": "gzip, deflate, br, zstd",
             "accept-language": "en-US,en;q=0.9",
-            "authorization": f"Bearer {token}",
+            "authorization": f"Berear {token}",
             "content-type": "application/json",
             "origin": "chrome-extension://fpdkjdnhkakefebpekbdhillbhonfjjp",
             "priority": "u=1, i",
             "sec-fetch-dest": "empty",
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "cross-site",
-            "user-agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
+            "user-agent": self.account_details['user_agent']
         }
         body = {
             "username": self.account_details['name'],
@@ -230,38 +456,86 @@ class Account:
             "numberoftabs": 0,
             "_v": SETTINGS['VERSION'],
         }
-        response = await self.session.post(url, json=body, headers=headers)
-        return response.status_code
+        self.session.headers.update(headers)
+        async with self.session.post(url, json=body) as response:
+            logging.info(await response.json())
+            return response.status
 
-    async def full_registration(self) -> int:
+    async def full_registration(self) -> Dict[str, bool]:
+        logging.info(self.account_details)
+        if self.account_details.get('registration_failed'):
+            logging.warning(f"Skipping full_registration for failed account: {self.account_details['name']}")
+            return {"registered": False, "verified": False}
+        
         logging.info(f"Starting registration for {self.account_details['name']}")
+        await self.create_session()
+        result = {"registered": False, "verified": False}
+        max_registration_attempts = SETTINGS['max_registration_attempts']
+        max_verification_attempts = SETTINGS['max_verification_attempts']
 
-        sl=random.randint(1,60)
-        print(f'sleeping for {sl}')
-        await asyncio.sleep(sl)
-        await self.set_session()
-        try:
-            for _ in range(10):
-                if not self.account_details.get('registered'):
-                    puzzle_id = await self.get_puzzle()
-                    img_base_64 = await self.get_puzzle_base_64(puzzle_id)
-                    solution = await solve_captcha(img_base_64)
-                    await asyncio.sleep(25)
-                    response = await self.register_user(puzzle_id, solution)
-                    if response == 200:
-                        await self.update_registration_status(True)
-                        logging.info(f"Account {self.account_details['name']} successfully registered")
-                        break
-            for _ in range(10):
-                if not self.account_details.get('verified'):
+        account = await self.collection.find_one({'_id': self.account_details['_id']})
+
+        for _ in range(max_registration_attempts):
+            if not self.account_details.get('registered'):
+                registration_attempts = account.get('registration_attempts', 0)
+                if registration_attempts < max_registration_attempts:
+                    try:
+                        puzzle_id = await self.get_puzzle()
+                        img_base_64 = await self.get_puzzle_base_64(puzzle_id)
+                        solution = await solve_captcha(img_base_64, owner_id=self.account_details['owner'])
+                        await asyncio.sleep(60)
+                        response = await self.register_user(puzzle_id, solution)
+                        if response == 200:
+                            await self.update_registration_status(True)
+                            logging.info(f"Account {self.account_details['name']} successfully registered")
+                            result["registered"] = True
+                            break
+                        else:
+                            await self.increment_registration_attempts()
+                            logging.warning(f"Registration failed for {self.account_details['name']}. Attempt {registration_attempts + 1}/{max_registration_attempts}")
+                    except Exception as e:
+                        await self.increment_registration_attempts()
+                        logging.error(f"Error during registration for {self.account_details['name']}: {str(e)}")
+                else:
+                    logging.error(f"Max registration attempts reached for {self.account_details['name']}")
+                    break
+
+        for _ in range(max_verification_attempts):
+            if result["registered"] and not self.account_details.get('verified'):
+                verification_attempts = account.get('verification_attempts', 0)
+                if verification_attempts < max_verification_attempts:
                     if await self.verify_mail():
                         await self.update_verification_status(True)
                         logging.info(f"Account {self.account_details['name']} successfully verified")
-                        return 200
-        except Exception as e:
-            logging.error(f"Error during registration: {e}")
-            await asyncio.sleep(10)
-        return 400
+                        result["verified"] = True
+                        break
+                    else:
+                        await self.increment_verification_attempts()
+                        logging.warning(f"Verification failed for {self.account_details['name']}. Attempt {verification_attempts + 1}/{max_verification_attempts}")
+                else:
+                    logging.error(f"Max verification attempts reached for {self.account_details['name']}")
+                    break
+
+        if self.account_details.get('registration_attempts', 0) >= SETTINGS['max_registration_attempts'] or self.account_details.get('verification_attempts', 0) >= SETTINGS['max_verification_attempts']:
+            await self.collection.update_one(
+                {'_id': self.account_details['_id']},
+                {'$set': {'registration_failed': True}}
+            )
+            logging.error(f"Account {self.account_details['name']} marked as failed after exhausting all registration attempts")
+
+        return result
+
+    async def increment_registration_attempts(self):
+        await self.collection.update_one(
+            {'_id': self.account_details['_id']},
+            {'$inc': {'registration_attempts': 1}}
+        )
+        
+    async def increment_verification_attempts(self):
+        await self.collection.update_one(
+            {'_id': self.account_details['_id']},
+            {'$inc': {'verification_attempts': 1}}
+        )
 
     async def update_registration_status(self, status: bool):
         await self.collection.update_one(
@@ -279,38 +553,48 @@ class Account:
 
     async def farm(self):
         logging.info(f"Starting farming for {self.account_details['name']}")
-        await self.set_session()
-        print('token---\n',self.account_details.get('token'),'\n---token')
-        if not self.account_details.get('registered') or not self.account_details.get('verified'):
-            await self.full_registration()
-        if not self.account_details.get('token'):
-            await self.login_with_retry()
-        
-        while not self.should_stop and self.account_details['account_state'] == 'active':
-            try:
-                await asyncio.gather(
-                    self.get_user_referral_points(self.account_details['token']),
-                    self.keep_alive_with_retry(self.account_details['token'])
-                )
-            except Exception as e:
-                logging.error(f"Error during farming: {e}")
-            await asyncio.sleep(110)
+        await self.create_session()
+        await self.set_headers()
+        try:
+            if not self.account_details.get('token'):
+                await self.login_with_retry()
+            
+            while not self.should_stop and self.account_details['account_state'] == 'active':
+                try:
+                    await asyncio.gather(
+                        self.get_user_referral_points(self.account_details['token']),
+                        self.keep_alive_with_retry(self.account_details['token']),
+                    )
+                except Exception as e:
+                    logging.error(f"Error during farming for {self.account_details['name']}: {e}", exc_info=True)
+                await asyncio.sleep(110)
+        finally:
+            await self.close_session()
 
     async def login_with_retry(self, max_retries: int = 10):
         for attempt in range(max_retries):
             try:
+                await self.create_session()
                 puzzle_id = await self.get_puzzle()
                 img_base_64 = await self.get_puzzle_base_64(puzzle_id)
-                solution = await solve_captcha(img_base_64)
-                await asyncio.sleep(25)
+                solution = await solve_captcha(img_base_64,owner_id=self.account_details['owner'])
+                await asyncio.sleep(40)
                 token = await self.login(puzzle_id=puzzle_id, solution=solution)
                 if token:
+                    with open('renewed_accounts.txt','a') as f:
+                        f.write(f"{self.account_details['name']}---{self.account_details['mail']}\n")
                     await self.update_token_in_db(token)
+                    self.account_details['token'] = token  # Update the token in memory
+                    logging.info(f"Successfully renewed token for account: {self.account_details['name']}")
                     return
+                else:
+                    logging.warning(f"Login attempt {attempt + 1} failed: No token received")
             except Exception as e:
-                logging.error(f"Login error (attempt {attempt + 1}): {e}")
+                logging.error(f"Login error for {self.account_details['name']} (attempt {attempt + 1}): {str(e)}", exc_info=True)
+            finally:
+                await self.close_session()
             await asyncio.sleep(10)
-        logging.error(f"Failed to login after {max_retries} attempts")
+        logging.error(f"Failed to renew token for {self.account_details['name']} after {max_retries} attempts")
 
     async def keep_alive_with_retry(self, token: str, max_retries: int = 5):
         for attempt in range(max_retries):
@@ -332,10 +616,10 @@ class Account:
     async def start_task(self):
         if self.task is None:
             self.should_stop = False
-            if not self.account_details.get('registered') or not self.account_details.get('verified'):
-                logging.info(f"Starting registration/verification for account {self.account_details['name']}")
-                await self.full_registration()
-            self.task = asyncio.create_task(self.farm())
+            if self.account_details.get('registered') or not self.account_details.get('verified'):
+                # logging.info(f"Starting registration/verification for account {self.account_details['name']}")
+                # await self.full_registration()
+                self.task = asyncio.create_task(self.farm())
 
     async def stop_task(self):
         if self.task is not None:
@@ -346,7 +630,19 @@ class Account:
             except asyncio.CancelledError:
                 pass
             self.task = None
+        await self.close_session()
 
+    async def check_ip(self):
+        url = "https://api.ipify.org"
+        try:
+            async with self.session.get(url,ssl=False) as response:
+                ip = await response.text()
+                logging.info(f"Request made from IP: {ip}")
+                return ip
+        except Exception as e:
+            logging.error(f"Error checking IP: {str(e)}")
+            return None
 
-manager = AccountsManager()
-asyncio.run(manager.run())
+if __name__ == "__main__":
+    manager = AccountsManager()
+    asyncio.run(manager.run())

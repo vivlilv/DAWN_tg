@@ -1,10 +1,9 @@
-[
-    {
-        "name": "gogogaga",
-        "mail": "somemail@outlook.com",
-        "mail_pass": "mail_password",
-        "referralCode": "",
-        "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
-        "proxy": "http://login:password@23.129.254.246:6228"
-    }
-]
+Оформление:
+account_name:mail:mail_password:proxy:registered:refcode(не обязательно)
+Если аккаунт уже зарегестрирован то вместо registered True, иначе False
+
+Пример зарегестрированного аккаунта без реф кода и незарегистрированного с реф кодом
+
+Пример:
+SinMamki somemail@outlook.com mail_password http://login:password@23.129.254.246:6228 True
+BratMamki somemail@outlook.com mail_password http://login:password@23.129.254.246:6228 False referralCode

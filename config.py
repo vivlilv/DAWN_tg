@@ -1,11 +1,15 @@
 SETTINGS = {
     'DB_NAME': 'dawn_profiles',
-    'COLLECTION_NAME': 'user_entries',
-    'CHECK_INTERVAL': 600,  # 10 хвилин
+    'ACCOUNTS_COLLECTION': 'user_entries',
+    'USERS_API_KEYS': 'users_api_keys',
+    'CHECK_INTERVAL': 300,
     'BASE_URL': 'https://www.aeropres.in/chromeapi/dawn/v1',
-    'VERSION': '1.0.7',
+    'VERSION': '1.0.8',
     'EXTENSION_ID': 'fpdkjdnhkakefebpekbdhillbhonfjjp',
     'GET_POINT_URL':'https://www.aeropres.in/api/atom/v1/userreferral/getpoint',
+    'REGISTRATION_THREADS' : 5,
+    'max_registration_attempts':20,
+    'max_verification_attempts':10,
     
     'DEFAULT_HEADERS': {
         "accept": "*/*",
