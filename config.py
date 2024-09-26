@@ -4,7 +4,7 @@ SETTINGS = {
     'USERS_API_KEYS': 'users_api_keys',
     'CHECK_INTERVAL': 300,
     'BASE_URL': 'https://www.aeropres.in/chromeapi/dawn/v1',
-    'VERSION': '1.0.8',
+    'VERSION': '1.0.9',
     'EXTENSION_ID': 'fpdkjdnhkakefebpekbdhillbhonfjjp',
     'GET_POINT_URL':'https://www.aeropres.in/api/atom/v1/userreferral/getpoint',
     'REGISTRATION_THREADS' : 5,
