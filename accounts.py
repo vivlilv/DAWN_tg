@@ -164,25 +164,6 @@ class AccountsManager:
             if account.account_details.get('registered') and account.account_details.get('verified'):
                 await account.start_task()
 
-    # async def register_account(self, account):
-    #     try:
-    #         logging.info(f"Starting registration for account {account.account_details['name']}")
-    #         result = await account.full_registration()
-    #         logging.info(result)
-    #         if result["registered"]:
-    #             self.add_new_accounts[account.account_details['_id']] = account
-    #             if result["verified"]:
-    #                 await self.update_registration_attempt(account, "Success")
-    #             else:
-    #                 await self.update_registration_attempt(account, "Registered but not verified")
-    #         else:
-    #             await self.update_registration_attempt(account, "Registration failed")
-    #     except Exception as e:
-    #         logging.error(f"Error registering account {account.account_details['name']}: {e}")
-    #     finally:
-    #         self.currently_registering.remove(account.account_details['_id'])
-    #         logging.info(f"Completed registration for account {account.account_details['name']}. Currently registering: {len(self.currently_registering)}")
-
     async def update_registration_attempt(self, account, status):
         await self.collection.update_one(
             {'_id': account.account_details['_id']},
@@ -231,8 +212,8 @@ class AccountsManager:
             await self.check_db_for_changes()
             # logging.info("Running active registered accounts")
             logging.info("Processing registration queue")
-            active_accounts_task = asyncio.create_task(self.run_active_registered_accounts())
-            registration_queue_task = asyncio.create_task(self.process_registration_queue())
+            asyncio.create_task(self.run_active_registered_accounts())
+            asyncio.create_task(self.process_registration_queue())
             
             while True:
                 if self.shutdown_event.is_set():

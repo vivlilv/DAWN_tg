@@ -258,13 +258,14 @@ async def retrieve_and_categorize_accounts(owner_id: str) -> str:
             registered_accounts.append(account_info)
             logging.info(f"Account categorized as valid: {account.get('mail', '')}")
         elif not registered or not verified:
-            if registration_attempts < SETTINGS['max_registration_attempts'] or verification_attempts < SETTINGS['max_verification_attempts']:
-                not_registered_accounts.append(account_info)
-                logging.info(f"Account categorized as not registered: {account.get('mail', '')}")
-            else:
+            if registration_attempts >= SETTINGS['max_registration_attempts'] or verification_attempts >= SETTINGS['max_verification_attempts']:
                 error_msg = "Ошибка верификации почты" if registered else "Ошибка прохождения капчи"
                 failed_accounts.append(f"{account_info} - {error_msg}")
                 logging.info(f"Account categorized as failed: {account.get('mail', '')}")
+
+            else:
+                not_registered_accounts.append(account_info)
+                logging.info(f"Account categorized as not registered: {account.get('mail', '')}")
         else:
             logging.warning(f"Account in unexpected state: {account.get('mail', '')}")
 
@@ -385,75 +386,6 @@ async def mark_account_as_failed(account_id):
         {'_id': account_id},
         {'$set': {'registration_failed': True}}
     )
-
-proxies = [
-    "http://tbtvmzii:2qcqv4hp8yqm@23.129.254.246:6228",
-    "http://tbtvmzii:2qcqv4hp8yqm@209.242.204.133:5874",
-    "http://tbtvmzii:2qcqv4hp8yqm@104.239.104.83:6307",
-    "http://tbtvmzii:2qcqv4hp8yqm@198.46.202.242:5522",
-    "http://tbtvmzii:2qcqv4hp8yqm@45.87.69.155:6160",
-    "http://tbtvmzii:2qcqv4hp8yqm@104.239.44.34:5956",
-    "http://tbtvmzii:2qcqv4hp8yqm@104.239.73.233:6776",
-    "http://tbtvmzii:2qcqv4hp8yqm@172.245.157.180:6765",
-    "http://tbtvmzii:2qcqv4hp8yqm@64.43.91.36:6807",
-    "http://tbtvmzii:2qcqv4hp8yqm@64.64.115.21:5656",
-    "http://tbtvmzii:2qcqv4hp8yqm@5.154.254.171:5182",
-    "http://tbtvmzii:2qcqv4hp8yqm@198.105.111.201:6879",
-    "http://tbtvmzii:2qcqv4hp8yqm@84.33.26.37:5708",
-    "http://tbtvmzii:2qcqv4hp8yqm@45.192.134.248:6569",
-    "http://tbtvmzii:2qcqv4hp8yqm@104.239.0.182:5883",
-    "http://tbtvmzii:2qcqv4hp8yqm@104.238.50.116:6662",
-    "http://tbtvmzii:2qcqv4hp8yqm@198.46.246.128:6752",
-    "http://tbtvmzii:2qcqv4hp8yqm@38.154.204.112:8153",
-    "http://tbtvmzii:2qcqv4hp8yqm@109.196.163.55:6153",
-    "http://tbtvmzii:2qcqv4hp8yqm@154.73.249.211:6790",
-    "http://tbtvmzii:2qcqv4hp8yqm@172.84.183.100:5660",
-    "http://tbtvmzii:2qcqv4hp8yqm@104.239.22.79:6457",
-    "http://tbtvmzii:2qcqv4hp8yqm@64.137.37.172:6762",
-    "http://tbtvmzii:2qcqv4hp8yqm@45.43.178.49:5756",
-    "http://tbtvmzii:2qcqv4hp8yqm@102.212.90.128:5822",
-    "http://tbtvmzii:2qcqv4hp8yqm@104.239.76.100:6759",
-    "http://tbtvmzii:2qcqv4hp8yqm@64.137.8.19:6701",
-    "http://tbtvmzii:2qcqv4hp8yqm@38.154.204.150:8191",
-    "http://tbtvmzii:2qcqv4hp8yqm@198.154.89.220:6311",
-    "http://tbtvmzii:2qcqv4hp8yqm@192.3.48.232:6225",
-    "http://tbtvmzii:2qcqv4hp8yqm@154.92.123.33:5371",
-    "http://tbtvmzii:2qcqv4hp8yqm@45.192.155.15:7026",
-    "http://tbtvmzii:2qcqv4hp8yqm@5.154.254.105:5116",
-    "http://tbtvmzii:2qcqv4hp8yqm@216.173.107.143:6111",
-    "http://tbtvmzii:2qcqv4hp8yqm@107.181.142.42:5635",
-    "http://tbtvmzii:2qcqv4hp8yqm@137.59.4.216:6085",
-    "http://tbtvmzii:2qcqv4hp8yqm@142.147.244.149:6393",
-    "http://tbtvmzii:2qcqv4hp8yqm@103.80.10.246:6524",
-    "http://tbtvmzii:2qcqv4hp8yqm@93.120.32.42:9226",
-    "http://tbtvmzii:2qcqv4hp8yqm@166.88.83.80:6737",
-    "http://tbtvmzii:2qcqv4hp8yqm@45.146.28.75:6255",
-    "http://tbtvmzii:2qcqv4hp8yqm@64.137.14.241:5907",
-    "http://tbtvmzii:2qcqv4hp8yqm@64.64.115.32:5667",
-    "http://tbtvmzii:2qcqv4hp8yqm@31.223.189.108:6374",
-    "http://tbtvmzii:2qcqv4hp8yqm@107.181.143.193:6324"
-]
-
-async def update_proxies():
-    cursor = collection.find({})
-    proxies_iter = iter(proxies)
-    
-    async for document in cursor:
-        try:
-            new_proxy = next(proxies_iter)
-        except StopIteration:
-            logging.error("Not enough proxies to update all documents.")
-            break
-        
-        result = await collection.update_one(
-            {'_id': document['_id']},
-            {'$set': {'proxy': new_proxy}}
-        )
-        
-        if result.modified_count > 0:
-            logging.info(f"Updated proxy for document {document['_id']}: {new_proxy}")
-        else:
-            logging.warning(f"Failed to update proxy for document {document['_id']}")
 
 
 

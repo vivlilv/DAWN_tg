@@ -57,7 +57,7 @@ async def send_help_message(message):
         "🔄 Старт/Стоп фарминга: Управляйте работой ваших аккаунтов.\n\n"
         "📊 Статистика: Просмотрите общую статистику по вашим аккаунтам.\n\n"
         "ℹ️ Информация об аккаунтах: Получите детальную информацию о каждом аккаунте.\n\n"
-        "Если у вас возникли вопросы, пожалуйста, свяжитесь с админ��стратором."
+        "Если у вас возникли вопросы, пожалуйста, свяжитесь с администратором."
     )
     await bot.send_message(message.chat.id, help_text, reply_markup=create_main_keyboard())
 
@@ -91,6 +91,7 @@ async def farm_command(message):
         await bot.send_message(message.chat.id, 'Не найдено аккаунтов, добавьте их с помощью кнопки "Добавить аккаунты".')
     else:
         await bot.send_message(message.chat.id, f'Успешно изменено состояние аккаунтов с {result[1]} на {result[2]}')
+    await bot.send_message(message.chat.id, "Выберите следующее действие:", reply_markup=create_main_keyboard())
 
 async def stats_command(message):
     user_id = message.chat.id
@@ -99,7 +100,8 @@ async def stats_command(message):
         await bot.send_message(message.chat.id, 'Не найдено аккаунтов, добавьте их с помощью кнопки "Добавить аккаунты".')
     else:
         await bot.send_message(message.chat.id, f'У вас: {result["accounts"]} аккаунтов\nУже зарегистрировано: {result["fully_registered_and_verified"]}\nНЕ прошедших: {result["registration_failed"]}\n{result["total_points"]} поинтов в сумме')
-
+    await bot.send_message(message.chat.id, "Выберите следующее действие:", reply_markup=create_main_keyboard())
+    
 async def info_accounts_command(message):
     user_id = message.chat.id
     
@@ -112,6 +114,7 @@ async def info_accounts_command(message):
     except Exception as e:
         logging.error(f"Error in info_accounts_command: {str(e)}")
         await bot.send_message(message.chat.id, 'Произошла ошибка при подготовке информации. Пожалуйста, попробуйте позже.')
+    await bot.send_message(message.chat.id, "Выберите следующее действие:", reply_markup=create_main_keyboard())
 
 async def set_api_key_command(message):
     user_id = str(message.chat.id)
@@ -125,6 +128,7 @@ async def set_api_key_command(message):
         "Пожалуйста, отправьте ваш API ключ от CapMonster в следующем сообщении."
     )
     await bot.send_message(message.chat.id, instructions, parse_mode='Markdown', disable_web_page_preview=True)
+    await bot.send_message(message.chat.id, "Выберите следующее действие:", reply_markup=create_main_keyboard())
 
 @bot.message_handler(content_types=['document'])
 async def handle_docs(message):
@@ -193,6 +197,7 @@ async def handle_all_messages(message):
         await receive_api_key(message)
     else:
         await bot.reply_to(message, "Извините, я не понимаю эту команду. Пожалуйста, используйте кнопки меню.")
+    await bot.send_message(message.chat.id, "Выберите следующее действие:", reply_markup=create_main_keyboard())
 
 async def main():
     while True:

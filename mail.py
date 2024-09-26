@@ -1,9 +1,6 @@
 import imaplib
 import email
 from email.header import decode_header
-import imaplib
-import email
-from email.header import decode_header
 import re
 
 
@@ -12,38 +9,28 @@ def decode_if_bytes(value, encoding="utf-8"):
         try:
             return value.decode(encoding)
         except (UnicodeDecodeError, LookupError):
-            # Fallback to default encoding if UTF-8 fails
             try:
-                return value.decode("latin-1")  # Common fallback encoding
+                return value.decode("latin-1")
             except:
-                return value.decode(errors="ignore")  # Ignore undecodable bytes
+                return value.decode(errors="ignore")
     return value
 
 
 def get_email_body(email_message):
-    # Check if the email message is multipart
     if email_message.is_multipart():
-        # Iterate through each part of the email
         for part in email_message.walk():
-            # If the content type is text/plain or text/html, we extract the body
             content_type = part.get_content_type()
             content_disposition = str(part.get("Content-Disposition"))
-
-            # Skip attachments
             if "attachment" in content_disposition:
                 continue
-
-            # Check if the part is either text/plain or text/html
             if content_type == "text/plain" or content_type == "text/html":
                 try:
-                    # Get the email body
                     body = part.get_payload(decode=True)
                     return decode_if_bytes(body)
                 except Exception as e:
                     print(f"Failed to decode part: {e}")
                     return None
     else:
-        # If it's not multipart, extract the payload (the body)
         try:
             body = email_message.get_payload(decode=True)
             return decode_if_bytes(body)
@@ -52,54 +39,49 @@ def get_email_body(email_message):
             return None
 
 
-def fetch_emails_from_folder(imap, folder, target_sender):
-    imap.select(folder)
+def fetch_emails_from_all_folders(imap, target_sender):
+    status, folders = imap.list()
+    if status != "OK":
+        print("Failed to retrieve folders")
+        return None
 
-    print(f"\nSearching for emails from {target_sender} in {folder}...")
-    _, all_messages = imap.search(None, "ALL")
-    all_messages = all_messages[0].split()
-
-    # Process each email
-    for num in all_messages:
-        _, msg_data = imap.fetch(num, "(RFC822)")
-        for response_part in msg_data:
-            if isinstance(response_part, tuple):
-                email_body = response_part[1]
-                email_message = email.message_from_bytes(email_body)
-
-                # Extract sender
-                sender = decode_header(email_message.get("From", ""))[0][0]
-                sender = decode_if_bytes(sender)
-
-                # Check if the sender matches the target sender
-                if target_sender in sender:
-                    # Extract subject
-                    subject = decode_header(email_message.get("Subject", ""))[0][0]
-                    subject = decode_if_bytes(subject)
-
-                    # Extract date
-                    date = email_message.get("Date", "")
-
-                    # Extract the body
-                    body = get_email_body(email_message)
-
-                    return body
+    for folder in folders:
+        folder_name = folder.decode().split(' "/" ')[-1]
+        imap.select(folder_name)
+        print(f"\nSearching for emails from {target_sender} in {folder_name}...")
+        _, all_messages = imap.search(None, "ALL")
+        all_messages = all_messages[0].split()
+        for num in all_messages:
+            _, msg_data = imap.fetch(num, "(RFC822)")
+            for response_part in msg_data:
+                if isinstance(response_part, tuple):
+                    email_body = response_part[1]
+                    email_message = email.message_from_bytes(email_body)
+                    sender = decode_header(email_message.get("From", ""))[0][0]
+                    sender = decode_if_bytes(sender)
+                    if target_sender in sender:
+                        subject = decode_header(email_message.get("Subject", ""))[0][0]
+                        subject = decode_if_bytes(subject)
+                        date = email_message.get("Date", "")
+                        body = get_email_body(email_message)
+                        return body
+    return None
 
 
-def get_specific_email_senders(username, password, target_sender):
-    # Connect to the IMAP server
-    imap_server = "outlook.office365.com"
+def get_specific_email_senders(username, password, target_sender, mail_type):
+    mail_type = username.split("@")[1]
+    
+    if mail_type == "rambler.ru":
+        imap_server = "imap.rambler.ru"
+    elif mail_type == "hotmail.com" or mail_type == "outlook.com":
+        imap_server = "outlook.office365.com"
+    else:
+        imap_server = "imap.firstmail.ltd"
+
     imap = imaplib.IMAP4_SSL(imap_server)
-
     try:
-        # Login to the server
         imap.login(username, password)
-
-        body = fetch_emails_from_folder(imap, "Junk", target_sender)
-        # if body is None:
-        #     # If not found in Junk, try Inbox
-        #     body = fetch_emails_from_folder(imap, "INBOX", target_sender)
-
+        body = fetch_emails_from_all_folders(imap, target_sender)
     except imaplib.IMAP4.error as e:
         print(f"An IMAP error occurred: {str(e)}")
     except Exception as e:
@@ -121,8 +103,17 @@ def extract_link_from_body(body):
     return None
 
 
-def get_verification_link(username,password, target_sender="hello@dawninternet.com"):
-    body = get_specific_email_senders(username, password, target_sender)
+def get_verification_link(username, password, target_sender="hello@dawninternet.com", mail_type="outlook"):
+    body = get_specific_email_senders(username, password, target_sender, mail_type)
     link = extract_link_from_body(body)
     print(f"Extracted link: {link}")
     return link
+
+
+#test
+if __name__ == "__main__":
+    username = "yghdkcii@fumesmail.com"
+    password = "nkirqlomX!7839"
+    target_sender = "hello@dawninternet.com"
+    mail_type = username.split("@")[1]
+    get_verification_link(username, password, target_sender)
