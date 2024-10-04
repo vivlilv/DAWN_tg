@@ -484,7 +484,7 @@ class Account:
         
         logging.info(f"Starting registration for {self.account_details['name']}")
         await self.create_session()
-        result = {"registered": False, "verified": False}
+        result = {"registered": self.account_details['registered'], "verified": self.account_details['verified']}
         max_registration_attempts = SETTINGS['max_registration_attempts']
         max_verification_attempts = SETTINGS['max_verification_attempts']
 
@@ -531,7 +531,7 @@ class Account:
                     logging.error(f"Max verification attempts reached for {self.account_details['name']}")
                     break
 
-        if self.account_details['registered'] == False or self.account_details['verified'] == False:
+        if not self.account_details.get('registered') or not self.account_details.get('verified'):
             await self.collection.update_one(
                 {'_id': self.account_details['_id']},
                 {'$set': {'registration_failed': True}}
