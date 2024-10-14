@@ -2,9 +2,10 @@ import os
 import asyncio
 from telebot.async_telebot import AsyncTeleBot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from mongo import process_txt_file, toggle_account_state, get_accounts_stats_by_owner_id, retrieve_and_categorize_accounts, save_api_key
+from mongo import process_excel_file, toggle_account_state, get_accounts_stats_by_owner_id, retrieve_and_categorize_accounts, save_api_key
 import logging
 from collections import defaultdict
+import openpyxl
 
 API_TOKEN = os.environ.get("API_TOKEN", "7214897743:AAHamDqE6ZFvemyLNQU-qF3CaU2ul3OEeC8")
 bot = AsyncTeleBot(API_TOKEN)
@@ -65,13 +66,15 @@ async def add_accounts_command(message):
     user_id = str(message.chat.id)
     waiting_for_accounts_file[user_id] = True
     
-    example_file_path = 'accounts_example.txt'
+    example_file_path = 'accounts_example.xlsx'
     user_name = message.chat.first_name or message.chat.username or "пользователь"
     
     instructions = (
         f'Привет, {user_name}! Для добавления аккаунтов, пожалуйста, следуйте этим шагам:\n\n'
-        '1. Подготовьте текстовый файл (.txt) с данными аккаунтов\n'
-        '2. Отправьте этот файл в чат\n\n'
+        '1. Подготовьте ексель файл (.xlsx) с данными аккаунтов\n'
+        '2. Отправьте этот файл в чат\n'
+        'Прокси только в формате http/https(как в примере файла)!!!\n'
+        'Если аккаунт не регистрирован в DAWN то поля registered verified-(FALSE)\n\n'
         'Ниже приведен пример правильного формата файла:'
     )
     
@@ -99,7 +102,7 @@ async def stats_command(message):
     if result['accounts'] == 0:
         await bot.send_message(message.chat.id, 'Не найдено аккаунтов, добавьте их с помощью кнопки "Добавить аккаунты".')
     else:
-        await bot.send_message(message.chat.id, f'У вас: {result["accounts"]} аккаунтов\nУже зарегистрировано: {result["fully_registered_and_verified"]}\nНЕ прошедших: {result["registration_failed"]}\n{result["total_points"]} поинтов в сумме')
+        await bot.send_message(message.chat.id, f'У вас: {result["accounts"]} аккаунтов\nУже зарегистрировано: {result["fully_registered_and_verified"]}\nВ процессе регистрации: {result['accounts']-result["fully_registered_and_verified"]-result["registration_failed"]}\nНЕ прошедших: {result["registration_failed"]}\n{result["total_points"]} поинтов в сумме')
     await bot.send_message(message.chat.id, "Выберите следующее действие:", reply_markup=create_main_keyboard())
     
 async def info_accounts_command(message):
@@ -134,20 +137,22 @@ async def set_api_key_command(message):
 async def handle_docs(message):
     user_id = str(message.chat.id)
     
-    if not waiting_for_accounts_file[user_id]:
+    if not waiting_for_accounts_file.get(user_id, False):
         await bot.reply_to(message, 'Пожалуйста, сначала используйте команду "Добавить аккаунты".')
         return
     
-    if message.document.mime_type == 'text/plain':
+    if message.document.mime_type == 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet':
         file_info = await bot.get_file(message.document.file_id)
+        file_path = f'temp_accounts_{user_id}.xlsx'  # Save the file with the user_id in the name
         downloaded_file = await bot.download_file(file_info.file_path)
         
-        with open('temp_accounts.txt', 'wb') as new_file:
+        with open(file_path, 'wb') as new_file:
             new_file.write(downloaded_file)
-        
+    
         try:
-            result = await process_txt_file('temp_accounts.txt', user_id)
-            os.remove('temp_accounts.txt')
+            result = await process_excel_file(file_path, user_id)  # Process the .xlsx file
+            os.remove(file_path)  # Remove the file after processing
+
             
             if isinstance(result, str):
                 if result.startswith('invalid_entries_'):
@@ -158,16 +163,19 @@ async def handle_docs(message):
                 else:
                     await bot.reply_to(message, result)
             else:
-                await bot.reply_to(message, 'Файл обработан успешно.')
+                await bot.reply_to(message, 'Все аккаунты прошли проверку и начинают регистрацию.')
         
         except Exception as e:
             logging.error(f"Error processing file: {str(e)}")
             await bot.reply_to(message, 'Произошла ошибка при обработке файла. Пожалуйста, попробуйте еще раз.')
     else:
-        await bot.reply_to(message, 'Пожалуйста, отправьте текстовый файл (.txt)')
+        await bot.reply_to(message, 'Пожалуйста, отправьте файл Excel (.xlsx)')
     
     waiting_for_accounts_file[user_id] = False
     await bot.send_message(message.chat.id, "Выберите следующее действие:", reply_markup=create_main_keyboard())
+
+
+
 
 @bot.message_handler(func=lambda message: waiting_for_api_key.get(str(message.chat.id), False))
 async def receive_api_key(message):

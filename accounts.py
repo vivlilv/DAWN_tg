@@ -19,7 +19,33 @@ import signal
 import sys
 import atexit
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+import logging
+
+LOG_COLORS = {
+    'INFO': '\033[92m',     # Green
+    'WARNING': '\033[93m',  # Yellow
+    'ERROR': '\033[91m',    # Red
+    'RESET': '\033[0m'      # Reset to default color
+}
+
+class CustomFormatter(logging.Formatter):
+    def format(self, record):
+        # Get the original message
+        log_msg = super().format(record)
+        
+        # Apply color based on the log level
+        log_color = LOG_COLORS.get(record.levelname, LOG_COLORS['RESET'])
+        return f"{log_color}{log_msg}{LOG_COLORS['RESET']}"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - [Function: %(funcName)s] - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+
+for handler in logging.getLogger().handlers:
+    handler.setFormatter(CustomFormatter('%(asctime)s - [Function: %(funcName)s] - %(levelname)s - %(message)s'))
+
 
 def parse_user_agent(user_agent):
     browser_match = re.search(r'(Opera|Chrome|Safari|Firefox|MSIE|Trident(?=/))', user_agent)
@@ -97,11 +123,12 @@ class AccountsManager:
                 for account_id, account_instance in self.add_new_accounts.items():
                     if account_id not in self.active_accounts:
                         self.active_accounts[account_id] = account_instance
-                        logging.info(f"Starting task for account {account_id}: {account_instance.account_details['mail']}")
+                        logging.info(f"Starting task for account {account_id}: {account_instance.account_details['mail']}\n")
                         asyncio.create_task(self.active_accounts[account_id].start_task())
                 self.add_new_accounts.clear()
             finally:
                 await asyncio.sleep(180)
+
     async def check_db_for_changes(self):
         current_active_accounts = await self.fetch_active_registered_verified_accounts()
         unregistered_or_unverified = await self.fetch_unregistered_or_unverified_accounts()
@@ -138,15 +165,14 @@ class AccountsManager:
             logging.info(f"Starting to process registration queue. Queue size: {len(self.registration_queue)}")
             while self.registration_queue and len(self.currently_registering) < self.max_simultaneous_registrations:
                 account = self.registration_queue.popleft()
-                if not account.account_details.get('registration_failed'):
-                    self.currently_registering.add(account.account_details['_id'])
+                if not account['registration_failed']:
+                    self.currently_registering.add(account['_id'])
                     tasks.append(asyncio.create_task(self.register_and_handle(account)))
-                    logging.info(f"Added account {account.account_details['name']} to registration tasks. Currently registering: {len(self.currently_registering)}")
+                    logging.info(f"Added account {account['name']} to registration tasks. Currently registering: {len(self.currently_registering)}")
                 else:
-                    logging.warning(f"Skipping registration for failed account: {account.account_details['name']}")
+                    logging.warning(f"Skipping registration for failed account: {account['name']}")
             
             if tasks:
-                logging.info(f"Waiting for {len(tasks)} registration tasks to complete.")
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 logging.info(f"Completed {len(done)} tasks, {len(pending)} tasks still pending.")
             else:
@@ -156,17 +182,17 @@ class AccountsManager:
     async def register_and_handle(self, account):
         try:
             delay = random.uniform(1, SETTINGS['REGISTRATION_THREADS']*3)
-            logging.info(f"Sleeping for {delay} seconds before next registration cycle for {account.account_details['mail']}")
+            logging.info(f"Sleeping for {delay} seconds before next registration cycle for {account['mail']}")
             await asyncio.sleep(delay)
             await account.full_registration()
         finally:
-            self.currently_registering.remove(account.account_details['_id'])
-            if account.account_details.get('registered') and account.account_details.get('verified'):
+            self.currently_registering.remove(account['_id'])
+            if account['registered'] and account['verified']:
                 await account.start_task()
 
     async def update_registration_attempt(self, account, status):
         await self.collection.update_one(
-            {'_id': account.account_details['_id']},
+            {'_id': account['_id']},
             {'$set': {'registration_attempt': status}}
         )
 
@@ -213,7 +239,7 @@ class AccountsManager:
             # logging.info("Running active registered accounts")
             logging.info("Processing registration queue")
             asyncio.create_task(self.run_active_registered_accounts())
-            asyncio.create_task(self.process_registration_queue())
+            # asyncio.create_task(self.process_registration_queue())
             
             while True:
                 if self.shutdown_event.is_set():
@@ -401,9 +427,12 @@ class Account:
             logging.error(f"Error during login request: {str(e)}", exc_info=True)
             return None
 
-    async def get_user_referral_points(self, token: str) -> Dict:
+    async def get_user_referral_points(self) -> Dict:
         await self.create_session()
         url = SETTINGS['GET_POINT_URL']
+
+        #token which is taken from DB dynamically
+        account = await self.collection.find_one({'_id': self.account_details['_id']})
 
         browser, version, platform = parse_user_agent(self.account_details['user_agent'])
         headers = {
@@ -413,7 +442,7 @@ class Account:
             "if-none-match": 'W/"336-Qpy+2RS1on9WRMSlwnrjPMYeucg"',
             "origin": "chrome-extension://fpdkjdnhkakefebpekbdhillbhonfjjp",
             "priority": "u=1, i",
-            "authorization": f"Berear {token}",
+            "authorization": f"Berear {account['token']}",
             "sec-ch-ua": f'"{browser}";v="{version}", "Not)A;Brand";v="99"',
             "sec-ch-ua-mobile": "?0",
             "sec-ch-ua-platform": f'"{platform}"',
@@ -422,20 +451,18 @@ class Account:
             "sec-fetch-site": "cross-site",
             "user-agent": self.account_details['user_agent']
         }
-        self.session.headers.update(headers)
 
         try:
-            async with self.session.get(url) as response:
+            async with self.session.get(url,headers=headers) as response:
+                print('*'*69)
                 logging.info(f"Response status: {response.status}")
-                # logging.info(f"Response headers: {dict(response.headers)}")
                 
-                response.raise_for_status()
                 data = await response.json()
-                
-                new_points = data['data']['rewardPoint']['points']
-                if new_points != self.points:
-                    self.points = new_points
-                    await self.update_points_in_db(new_points)
+                if data['data']['rewardPoint']['points']:
+                    new_points = data['data']['rewardPoint']['points']
+                    if new_points != self.points:
+                        self.points = new_points
+                        await self.update_points_in_db(new_points)
                 
                 logging.info(f"Current points: {self.points}")
                 return data
@@ -450,12 +477,15 @@ class Account:
         )
         logging.info(f"Updated points in database for {self.account_details['name']}: {new_points}")
 
-    async def keep_alive(self, token: str) -> int:
+    async def keep_alive(self) -> int:
+        account = await self.collection.find_one({'_id': self.account_details['_id']})
+        await self.update_token_in_db(account['token'])
+
         url = f"{SETTINGS['BASE_URL']}/userreward/keepalive"
         headers = {
             "accept-encoding": "gzip, deflate, br, zstd",
             "accept-language": "en-US,en;q=0.9",
-            "authorization": f"Berear {token}",
+            "authorization": f"Berear {account['token']}",
             "content-type": "application/json",
             "origin": "chrome-extension://fpdkjdnhkakefebpekbdhillbhonfjjp",
             "priority": "u=1, i",
@@ -473,7 +503,8 @@ class Account:
         }
         self.session.headers.update(headers)
         async with self.session.post(url, json=body) as response:
-            logging.info(await response.json())
+            
+            logging.warning(response.text)
             return response.status
 
     async def full_registration(self) -> Dict[str, bool]:
@@ -571,14 +602,14 @@ class Account:
         await self.create_session()
         await self.set_headers()
         try:
-            if not self.account_details.get('token'):
+            if not self.account_details.get('token') or self.account_details['token']=='':
                 await self.login_with_retry()
             
-            while not self.should_stop and self.account_details['account_state'] == 'active':
+            while self.account_details['account_state'] == 'active' and not self.should_stop:
                 try:
                     await asyncio.gather(
-                        self.get_user_referral_points(self.account_details['token']),
-                        self.keep_alive_with_retry(self.account_details['token']),
+                        self.get_user_referral_points(),#THE PROBLEM OF PASSING INITIAL TOKEN
+                        self.keep_alive_with_retry(),
                     )
                 except Exception as e:
                     logging.error(f"Error during farming for {self.account_details['name']}: {e}", exc_info=True)
@@ -615,10 +646,10 @@ class Account:
             await asyncio.sleep(10)
         logging.error(f"Failed to renew token for {self.account_details['name']} after {max_retries} attempts")
 
-    async def keep_alive_with_retry(self, token: str, max_retries: int = 5):
+    async def keep_alive_with_retry(self, max_retries: int = 5):
         for attempt in range(max_retries):
             try:
-                status = await self.keep_alive(token)
+                status = await self.keep_alive()
                 if status == 200:
                     return
             except Exception as e:
