@@ -1,7 +1,7 @@
 import asyncio
 import aiohttp
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import deque
 from typing import List, Dict, Optional
 from captcha import solve_captcha 
@@ -384,13 +384,17 @@ class Account:
         return None
 
     async def login(self, puzzle_id: str, solution: str) -> Optional[str]:
+
+        now = datetime.now(timezone.utc)
+        formatted_time = now.strftime('%Y-%m-%dT%H:%M:%S.') + f"{now.microsecond // 1000:03d}Z"
+
         url = f"{SETTINGS['BASE_URL']}/user/login/v2?appid=undefined"
         login_data = {
             "username": self.account_details['mail'],
             "password": self.account_details['mail_pass'],
             "logindata": {
                 "_v": SETTINGS['VERSION'],
-                "datetime": datetime.utcnow().isoformat(timespec='milliseconds') + 'Z'
+                "datetime": formatted_time
             },
             "puzzle_id": puzzle_id,
             "ans": solution
@@ -412,17 +416,15 @@ class Account:
             "sec-fetch-site": "cross-site",
             "user-agent": self.account_details['user_agent']
         }
-        self.session.headers.update(headers)
         try:
-            async with self.session.post(url, json=login_data) as response:
+            async with self.session.post(url,headers=headers, json=login_data) as response:
                 logging.info(await response.text())
-                response.raise_for_status()
-                data = await response.json()
-                if data.get('message') == 'Successfully logged in!':
-                    return data.get('data', {}).get('token')
-                else:
-                    logging.warning(f"Login failed: {data.get('message', 'Unknown error')}")
-                    return None
+                if 'application/json' in response.headers['Content-Type']:
+                    data = await response.json()
+                    if data.get('message') == 'Successfully logged in!':
+                        return data.get('data', {}).get('token')
+                    else:
+                        return None
         except Exception as e:
             logging.error(f"Error during login request: {str(e)}", exc_info=True)
             return None
@@ -456,16 +458,18 @@ class Account:
             async with self.session.get(url,headers=headers) as response:
                 print('*'*69)
                 logging.info(f"Response status: {response.status}")
+                if response.status<400:
+                    data = await response.json()
+                    if data['data']['rewardPoint']['points']:
+                        new_points = data['data']['rewardPoint']['points']
+                        if new_points != self.points:
+                            self.points = new_points
+                            await self.update_points_in_db(new_points)
                 
-                data = await response.json()
-                if data['data']['rewardPoint']['points']:
-                    new_points = data['data']['rewardPoint']['points']
-                    if new_points != self.points:
-                        self.points = new_points
-                        await self.update_points_in_db(new_points)
-                
-                logging.info(f"Current points: {self.points}")
-                return data
+                    logging.info(f"Current points: {self.points}")
+                    return data
+                else:
+                    logging.error(f'Failed with status: {response.status}')
         except Exception as e:
             logging.error(f"Error in get_user_referral_points: {str(e)}")
             raise
@@ -480,12 +484,13 @@ class Account:
     async def keep_alive(self) -> int:
         account = await self.collection.find_one({'_id': self.account_details['_id']})
         await self.update_token_in_db(account['token'])
+        temp_token = self.account_details['token']
 
         url = f"{SETTINGS['BASE_URL']}/userreward/keepalive"
         headers = {
             "accept-encoding": "gzip, deflate, br, zstd",
             "accept-language": "en-US,en;q=0.9",
-            "authorization": f"Berear {account['token']}",
+            "authorization": f"Berear {self.account_details['token']}",
             "content-type": "application/json",
             "origin": "chrome-extension://fpdkjdnhkakefebpekbdhillbhonfjjp",
             "priority": "u=1, i",
@@ -501,10 +506,22 @@ class Account:
             "Referer": "",
             "_v": SETTINGS['VERSION'],
         }
-        self.session.headers.update(headers)
-        async with self.session.post(url, json=body) as response:
-            
-            logging.warning(response.text)
+        async with self.session.post(url,headers=headers, json=body) as response:
+            try:
+                if response.status>=400:
+                    logging.warning(response.headers['Content-Type'])
+                    if 'application/json' in response.headers['Content-Type']:
+                        json_data = await response.json()
+                        if json_data['message'] == 'Your app session expired, Please login again.':
+                            logging.warning(f"Session expired for {self.account_details['mail']}")
+                            await self.login_with_retry()
+                            if temp_token==self.account_details['token']:
+                                await asyncio.sleep(3600)#if token hasn't been updated wait for an hour
+                    
+                else:
+                    logging.info(f'Successful keepalive for {self.account_details["mail"]}')
+            except Exception as e:
+                logging.error(f"Failed to parse JSON: {str(e)}")
             return response.status
 
     async def full_registration(self) -> Dict[str, bool]:
@@ -627,8 +644,8 @@ class Account:
                 await self.create_session()
                 puzzle_id = await self.get_puzzle()
                 img_base_64 = await self.get_puzzle_base_64(puzzle_id)
+                await asyncio.sleep(20)
                 solution = await solve_captcha(img_base_64,owner_id=self.account_details['owner'])
-                await asyncio.sleep(40)
                 token = await self.login(puzzle_id=puzzle_id, solution=solution)
                 if token:
                     with open('renewed_accounts.txt','a') as f:
@@ -666,9 +683,7 @@ class Account:
     async def start_task(self):
         if self.task is None:
             self.should_stop = False
-            if self.account_details.get('registered') or not self.account_details.get('verified'):
-                # logging.info(f"Starting registration/verification for account {self.account_details['name']}")
-                # await self.full_registration()
+            if self.account_details.get('registered')==True and self.account_details.get('verified')==True:
                 self.task = asyncio.create_task(self.farm())
 
     async def stop_task(self):
