@@ -469,7 +469,25 @@ class Account:
                     logging.info(f"Current points: {self.points}")
                     return data
                 else:
-                    logging.error(f'Failed with status: {response.status}')
+                    logging.error(f'Failed with status: {response.status}. Trying different proxy...')
+                    with open('proxies.txt', 'r') as f:
+                        lines = f.readlines()
+                        for i in range(len(lines)):
+                            proxy = lines[random.randrange(0, len(lines)-1)].strip()  # Get a random proxy
+                            result = await self.check_ip()
+                            if result != 1:  # if returns IP
+                                existing_account = await self.collection.find_one({'proxy': proxy})
+                                if existing_account is None:  # Proxy is not in use
+                                    self.account_details['proxy'] = proxy
+                                    await self.update_proxy_in_db(proxy)
+                                    
+                                    # Remove the used proxy from the file
+                                    lines.remove(f"{proxy}\n")  # Remove the selected proxy
+                                    with open('proxies.txt', 'w') as f_write:
+                                        f_write.writelines(lines)  # Write remaining proxies back to the file
+                                    break
+                                else:
+                                    logging.warning(f"Proxy {proxy} is already in use by another account.")
         except Exception as e:
             logging.error(f"Error in get_user_referral_points: {str(e)}")
             raise
@@ -516,7 +534,7 @@ class Account:
                             logging.warning(f"Session expired for {self.account_details['mail']}")
                             await self.login_with_retry()
                             if temp_token==self.account_details['token']:
-                                await asyncio.sleep(3600)#if token hasn't been updated wait for an hour
+                                await asyncio.sleep(36000)#if token hasn't been updated wait for 10 hours
                     
                 else:
                     logging.info(f'Successful keepalive for {self.account_details["mail"]}')
